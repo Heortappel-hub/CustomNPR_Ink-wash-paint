@@ -1,5 +1,4 @@
-﻿File: Unity_ChinesePainting-master\Assets\Shader\MountainShader.shader
-````````
+﻿
 // Upgrade NOTE: replaced 'mul(UNITY_MATRIX_MVP,*)' with 'UnityObjectToClipPos(*)'
 
 Shader "ChinesePainting/MountainShader" 
