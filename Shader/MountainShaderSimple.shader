@@ -26,6 +26,12 @@ Shader "ChinesePainting/MountainShaderSimple"
 		_Resolution ("Resolution", Float) = 800
 		_HStep ("Horizontal Step", Range(0, 1)) = 0.5
 		_VStep ("Vertical Step", Range(0, 1)) = 0.5
+
+		[Header(Rim Light)]
+		[Toggle(_USERIMLIGHT_ON)] _UseRimLight ("Use Rim Light", Float) = 0
+		_RimColor ("Rim Color", Color) = (0,1,1,1)
+		_RimRate ("Rim Rate (Power)", Range(0.1, 8)) = 1.0
+		_RimIntensity ("Rim Intensity", Range(0, 2)) = 1.0
 	}
 	
 	SubShader 
@@ -179,6 +185,7 @@ Shader "ChinesePainting/MountainShaderSimple"
 			#pragma fragment frag
 			#pragma multi_compile_fwdbase
 			#pragma shader_feature _USEKUWAHARA_ON
+			#pragma shader_feature _USERIMLIGHT_ON
 			
 			#include "UnityCG.cginc"
 			#include "Lighting.cginc"
@@ -195,6 +202,9 @@ Shader "ChinesePainting/MountainShaderSimple"
 			float _Resolution;
 			float _HStep;
 			float _VStep;
+			float4 _RimColor;
+			float _RimRate;
+			float _RimIntensity;
 			
 			struct a2v 
 			{
@@ -312,6 +322,14 @@ Shader "ChinesePainting/MountainShaderSimple"
 					finalColor = KuwaharaFilter(_Ramp, cuv);
 				#else
 					finalColor = GaussianBlur(_Ramp, cuv);
+				#endif
+
+				// Rim Light: 边缘高光, 与视线方向夹角大处亮
+				#ifdef _USERIMLIGHT_ON
+					fixed3 worldViewDir = normalize(UnityWorldSpaceViewDir(i.worldPos));
+					fixed rim = 1.0 - saturate(dot(worldViewDir, worldNormal));
+					rim = pow(saturate(rim), _RimRate) * _RimIntensity;
+					finalColor = lerp(finalColor, _RimColor.rgb, saturate(rim));
 				#endif
 
 				return float4(finalColor, 1.0);

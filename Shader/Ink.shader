@@ -1,37 +1,42 @@
-Shader "Hidden/Ink" {
-    Properties {
-        _MainTex ("Texture", 2D) = "white" {}
+Shader "Hidden/Ink"
+{
+    Properties
+    {
+        _MainTex ("Source Texture", 2D) = "white" {}
     }
 
     CGINCLUDE
     #include "UnityCG.cginc"
 
-    sampler2D _MainTex, _CameraDepthTexture;
-    sampler2D _PaperTex;
-    sampler2D _NoiseTex;
-    sampler2D _StippleTex;
-    sampler2D _InkTex;
-    sampler2D _LumTex;
-    float4 _NoiseTex_TexelSize;
+    // Unity reserved / auto-bound
+    sampler2D _MainTex;
+    sampler2D _CameraDepthTexture;
     float4 _MainTex_TexelSize;
-    float _ContrastThreshold;
+
+    // Custom textures
+    sampler2D _TexPaper;
+    sampler2D _TexNoise;
+    sampler2D _TexStipple;
+    sampler2D _TexInk;
+    sampler2D _TexLuminance;
+
+    // General controls
+    float _EdgeThreshold;
+    float _LuminanceContrast;
     float _LuminanceCorrection;
-    float _Contrast;
+    float _UseInputImage;
+
+    // Stippling
     float _StippleSize;
+    float _StippleWorldScale;
+
+    // Ink bleed
     float _BleedRadius;
     float _BleedStrength;
     float _BleedIrregularity;
     float _BleedDensity;
-    float _DogSigma;
-    float _DogK;
-    float _DogGain;
-    uint  _UsingImage;
-
-    float4x4 _InvViewProj;
-    float _StippleWorldScale;
     float _BleedWorldScale;
 
-    float _BleedViewPower;
     float _BleedPartialThreshold;
     float _BleedDarkThreshold;
     float _BleedDarkSoftness;
@@ -39,334 +44,474 @@ Shader "Hidden/Ink" {
     float _BleedFadeGamma;
     float _BleedDebug;
 
-    struct VertexData {
+    // DoG
+    float _DoGSigma;
+    float _DoGK;
+    float _DoGGain;
+
+    // Edge depth fade (远山淡墨)
+    float _EdgeFadeNear;
+    float _EdgeFadeFar;
+
+    // Matrices
+    float4x4 _InvViewProj;
+
+    struct appdata
+    {
         float4 vertex : POSITION;
         float2 uv     : TEXCOORD0;
     };
 
-    struct v2f {
-        float2 uv    : TEXCOORD0;
-        float4 vertex         : SV_POSITION;
-        float4 screenPosition : TEXCOORD1;
+    struct v2f
+    {
+        float2 uv     : TEXCOORD0;
+        float4 vertex : SV_POSITION;
+        float4 screen : TEXCOORD1;
     };
 
-    v2f vp(VertexData v) {
-        v2f f;
-        f.vertex = UnityObjectToClipPos(v.vertex);
-        f.uv = v.uv;
-        f.screenPosition = ComputeScreenPos(f.vertex);
-        return f;
+    v2f vert(appdata v)
+    {
+        v2f o;
+        o.vertex = UnityObjectToClipPos(v.vertex);
+        o.uv = v.uv;
+        o.screen = ComputeScreenPos(o.vertex);
+        return o;
     }
 
-    float3 ReconstructWorldPos(float2 uv) {
+    float3 ReconstructWorldPosition(float2 uv)
+    {
         float rawDepth = SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uv);
+
         float4 ndc = float4(uv * 2.0 - 1.0, rawDepth, 1.0);
+
         #if UNITY_UV_STARTS_AT_TOP
             ndc.y = -ndc.y;
         #endif
+
         float4 worldPos = mul(_InvViewProj, ndc);
         return worldPos.xyz / worldPos.w;
     }
 
-    float3 ReconstructWorldNormal(float2 uv) {
-        float3 c = ReconstructWorldPos(uv);
-        float3 r = ReconstructWorldPos(uv + float2(_MainTex_TexelSize.x, 0));
-        float3 u = ReconstructWorldPos(uv + float2(0, _MainTex_TexelSize.y));
-        float3 n = cross(r - c, u - c);
-        return normalize(n);
+    float GaussianWeight(float2 offset, float sigma)
+    {
+        float sigmaSquared = sigma * sigma;
+        return exp(-dot(offset, offset) / (2.0 * sigmaSquared));
     }
+
     ENDCG
 
-    SubShader {
-        Cull Off ZWrite Off ZTest Always
+    SubShader
+    {
+        Cull Off
+        ZWrite Off
+        ZTest Always
 
+        // ------------------------------------------------------------
         // 0 - Luminance
-        Pass {
+        // ------------------------------------------------------------
+        Pass
+        {
             CGPROGRAM
-            #pragma vertex vp
-            #pragma fragment fp
+            #pragma vertex vert
+            #pragma fragment frag
 
-            fixed4 fp(v2f i) : SV_Target {
-                float lum = LinearRgbToLuminance(tex2D(_MainTex, i.uv).rgb);
-                return fixed4(lum, lum, lum, lum);
+            fixed4 frag(v2f i) : SV_Target
+            {
+                float luminance = LinearRgbToLuminance(tex2D(_MainTex, i.uv).rgb);
+                return fixed4(luminance, luminance, luminance, luminance);
             }
             ENDCG
         }
 
-        // 1 - Edge Detection By Contrast
-        Pass {
+        // ------------------------------------------------------------
+        // 1 - Local Contrast Edge Detection
+        // ------------------------------------------------------------
+        Pass
+        {
             CGPROGRAM
-            #pragma vertex vp
-            #pragma fragment fp
+            #pragma vertex vert
+            #pragma fragment frag
 
-            fixed4 fp(v2f i) : SV_Target {
-                float m = tex2D(_MainTex, i.uv).r;
-                float n = tex2D(_MainTex, i.uv + _MainTex_TexelSize.xy * float2( 0,  1)).r;
-                float e = tex2D(_MainTex, i.uv + _MainTex_TexelSize.xy * float2( 1,  0)).r;
-                float s = tex2D(_MainTex, i.uv + _MainTex_TexelSize.xy * float2( 0, -1)).r;
-                float w = tex2D(_MainTex, i.uv + _MainTex_TexelSize.xy * float2(-1,  0)).r;
-
-                float contrast = max(max(max(max(n, e), s), w), m) -
-                                min(min(min(min(n, e), s), w), m);
-
-                float edge = contrast > _ContrastThreshold ? 1.0 : 0.0;
-                return fixed4(edge, edge, edge, edge);
-            }
-            ENDCG
-        }
-
-        // 2 - Edge Detection By Sobel-Feldman Operator
-        Pass {
-            CGPROGRAM
-            #pragma vertex vp
-            #pragma fragment fp
-
-            fixed4 fp(v2f i) : SV_Target {
-                int3x3 Kx = { 1, 0,-1,  2, 0,-2,  1, 0,-1 };
-                int3x3 Ky = { 1, 2, 1,  0, 0, 0, -1,-2,-1 };
-
-                float Gx = 0.0f;
-                float Gy = 0.0f;
-
-                [unroll]
-                for (int x = -1; x <= 1; ++x) {
-                    [unroll]
-                    for (int y = -1; y <= 1; ++y) {
-                        float2 uv = i.uv + _MainTex_TexelSize.xy * float2(x, y);
-                        float l = tex2D(_MainTex, uv).r;
-                        Gx += Kx[x + 1][y + 1] * l;
-                        Gy += Ky[x + 1][y + 1] * l;
-                    }
-                }
-
-                float Mag = sqrt(Gx * Gx + Gy * Gy);
-                float edge = Mag > _ContrastThreshold ? 1.0 : 0.0;
-                return fixed4(edge, edge, edge, edge);
-            }
-            ENDCG
-        }
-
-        // 3 - Edge Detection By Prewitt Operator
-        Pass {
-            CGPROGRAM
-            #pragma vertex vp
-            #pragma fragment fp
-
-            fixed4 fp(v2f i) : SV_Target {
-                int3x3 Kx = { 1, 0,-1,  1, 0,-1,  1, 0,-1 };
-                int3x3 Ky = { 1, 1, 1,  0, 0, 0, -1,-1,-1 };
-
-                float Gx = 0.0f;
-                float Gy = 0.0f;
-
-                [unroll]
-                for (int x = -1; x <= 1; ++x) {
-                    [unroll]
-                    for (int y = -1; y <= 1; ++y) {
-                        float2 uv = i.uv + _MainTex_TexelSize.xy * float2(x, y);
-                        float l = tex2D(_MainTex, uv).r;
-                        Gx += Kx[x + 1][y + 1] * l;
-                        Gy += Ky[x + 1][y + 1] * l;
-                    }
-                }
-
-                float Mag = sqrt(Gx * Gx + Gy * Gy);
-                float edge = Mag > _ContrastThreshold ? 1.0 : 0.0;
-                return fixed4(edge, edge, edge, edge);
-            }
-            ENDCG
-        }
-
-        // 4 - Stippling
-        Pass {
-            CGPROGRAM
-            #pragma vertex vp
-            #pragma fragment fp
-
-            float4 fp(v2f i) : SV_Target {
-                float luminance = tex2D(_MainTex, i.uv).r;
-
-                float3 wp = ReconstructWorldPos(i.uv);
-                float2 noiseCoord = (wp.xz + wp.yy) * _StippleWorldScale;
-                noiseCoord *= _StippleSize;
-                float noise = tex2Dlod(_NoiseTex, float4(noiseCoord, 0, 0)).a;
-
-                luminance = saturate(_Contrast * (luminance - 0.5) + 0.5);
-                luminance = saturate(pow(luminance, 1.0 / _LuminanceCorrection));
-
-                return luminance < noise ? 1.0 : 0.0;
-            }
-            ENDCG
-        }
-
-        // 5 - Combination (edge + stipple)
-        Pass {
-            CGPROGRAM
-            #pragma vertex vp
-            #pragma fragment fp
-
-            float4 fp(v2f i) : SV_Target {
-                float  edge    = tex2D(_MainTex, i.uv).r;
-                float4 stipple = tex2D(_StippleTex, i.uv);
-                float  depth   = saturate(1.0 - Linear01Depth(tex2D(_CameraDepthTexture, i.uv).r));
-
-                if (!_UsingImage && depth < 0.0001)
-                    stipple *= depth;
-
-                return 1.0 - (edge + stipple);
-            }
-            ENDCG
-        }
-
-        // 6 - Color (paper/ink swap)
-        Pass {
-            CGPROGRAM
-            #pragma vertex vp
-            #pragma fragment fp
-
-            float4 fp(v2f i) : SV_Target {
-                float4 ink   = tex2D(_InkTex, i.uv);
-                float4 paper = tex2D(_PaperTex, i.uv);
-                float  col   = tex2D(_MainTex, i.uv).r;
-                return col >= 1.0 ? paper : ink;
-            }
-            ENDCG
-        }
-
-        // 7 - Ink Bleed (水墨晕染：边缘不规则扩散)
-        Pass {
-            CGPROGRAM
-            #pragma vertex vp
-            #pragma fragment fp
-
-            static const float2 kPoisson12[12] = {
-                float2(-0.326, -0.406), float2(-0.840, -0.074),
-                float2(-0.696,  0.457), float2(-0.203,  0.621),
-                float2( 0.962, -0.195), float2( 0.473, -0.480),
-                float2( 0.519,  0.767), float2( 0.185, -0.893),
-                float2( 0.507,  0.064), float2( 0.896,  0.412),
-                float2(-0.322, -0.933), float2(-0.792, -0.598)
-            };
-
-            float4 fp(v2f i) : SV_Target {
+            fixed4 frag(v2f i) : SV_Target
+            {
                 float center = tex2D(_MainTex, i.uv).r;
 
-                float3 wp = ReconstructWorldPos(i.uv);
-                float2 wuv = (wp.xz + wp.yy) * _BleedWorldScale;
+                float north = tex2D(_MainTex, i.uv + _MainTex_TexelSize.xy * float2( 0,  1)).r;
+                float east  = tex2D(_MainTex, i.uv + _MainTex_TexelSize.xy * float2( 1,  0)).r;
+                float south = tex2D(_MainTex, i.uv + _MainTex_TexelSize.xy * float2( 0, -1)).r;
+                float west  = tex2D(_MainTex, i.uv + _MainTex_TexelSize.xy * float2(-1,  0)).r;
 
-                float macroNoise = tex2D(_NoiseTex, wuv * 0.6).r;
-                float microNoise = tex2D(_NoiseTex, wuv * 7.3 + float2(0.37, 0.11)).r;
+                float maxValue = max(max(max(max(north, east), south), west), center);
+                float minValue = min(min(min(min(north, east), south), west), center);
 
-                float lum = tex2D(_LumTex, i.uv).r;
-                float thr = saturate(_BleedDarkThreshold);
-                float sft = max(0.01, _BleedDarkSoftness);
-                float darkMask = 1.0 - smoothstep(thr - sft, thr + sft, lum);
-                darkMask = lerp(1.0, darkMask, step(0.5, _BleedDarkOnly));
+                float contrast = maxValue - minValue;
+                float edge = contrast > _EdgeThreshold ? 1.0 : 0.0;
 
-                float n0 = tex2D(_NoiseTex, wuv * 1.7 + float2(0.19, 0.83)).r;
-                float n1 = tex2D(_NoiseTex, wuv * 4.3 + float2(0.71, 0.29)).r;
-                float n2 = tex2D(_NoiseTex, wuv * 9.1 + float2(0.43, 0.57)).r;
-                float partialNoise = n0 * 0.5 + n1 * 0.35 + n2 * 0.15;
-                float partialMask = smoothstep(_BleedPartialThreshold,
-                                               saturate(_BleedPartialThreshold + 0.25),
-                                               partialNoise);
+                return fixed4(edge, edge, edge, edge);
+            }
+            ENDCG
+        }
 
-                float bleedMask = saturate(darkMask * partialMask);
+        // ------------------------------------------------------------
+        // 2 - Sobel-Feldman Edge Detection
+        // ------------------------------------------------------------
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert
+            #pragma fragment frag
 
-                if (bleedMask < 0.01)
-                    return float4(center, center, center, center);
+            fixed4 frag(v2f i) : SV_Target
+            {
+                int3x3 kernelX = { 1, 0, -1,
+                                   2, 0, -2,
+                                   1, 0, -1 };
 
-                float strength     = max(0.0, _BleedStrength) * bleedMask;
-                float strengthNorm = saturate(strength / 3.0);
+                int3x3 kernelY = { 1,  2,  1,
+                                   0,  0,  0,
+                                  -1, -2, -1 };
 
-                float radius = _BleedRadius *
-                               lerp(1.0 - _BleedIrregularity, 1.0 + _BleedIrregularity, microNoise) *
-                               lerp(0.2, 0.9, strengthNorm);
-
-                float falloffPower = lerp(4.0, 1.6, strengthNorm);
-
-                float accum = center;
+                float gradientX = 0.0;
+                float gradientY = 0.0;
 
                 [unroll]
-                for (int k = 0; k < 12; ++k) {
-                    float2 off    = kPoisson12[k];
-                    float  jitter = tex2D(_NoiseTex, wuv * 13.1 + off * 0.27).r;
-                    float  r      = radius * (0.35 + jitter);
+                for (int x = -1; x <= 1; ++x)
+                {
+                    [unroll]
+                    for (int y = -1; y <= 1; ++y)
+                    {
+                        float2 sampleUV = i.uv + _MainTex_TexelSize.xy * float2(x, y);
+                        float luminance = tex2D(_MainTex, sampleUV).r;
 
-                    float  e = tex2D(_MainTex, i.uv + _MainTex_TexelSize.xy * off * r).r;
-                    float  falloff = pow(saturate(1.0 - length(off)), falloffPower);
-
-                    accum = max(accum, e * falloff);
+                        gradientX += kernelX[x + 1][y + 1] * luminance;
+                        gradientY += kernelY[x + 1][y + 1] * luminance;
+                    }
                 }
 
-                float bleed = pow(saturate(accum * lerp(0.75, 1.15, macroNoise)),
-                                  1.0 / max(0.01, _BleedDensity));
+                float magnitude = sqrt(gradientX * gradientX + gradientY * gradientY);
+                float edge = magnitude > _EdgeThreshold ? 1.0 : 0.0;
 
-                bleed *= strengthNorm;
-                bleed  = saturate(bleed + max(0.0, strength - 1.0) * bleed * 0.2);
+                return fixed4(edge, edge, edge, edge);
+            }
+            ENDCG
+        }
 
-                float opacity = pow(saturate(bleed), max(0.05, _BleedFadeGamma));
-                opacity = saturate(opacity * lerp(0.9, 1.1, microNoise));
+        // ------------------------------------------------------------
+        // 3 - Prewitt Edge Detection
+        // ------------------------------------------------------------
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert
+            #pragma fragment frag
 
-                float inkColor = 1.0;
-                float target   = lerp(center, inkColor, opacity);
+            fixed4 frag(v2f i) : SV_Target
+            {
+                int3x3 kernelX = { 1, 0, -1,
+                                   1, 0, -1,
+                                   1, 0, -1 };
 
-                float result = lerp(center, target, bleedMask);
+                int3x3 kernelY = { 1,  1,  1,
+                                   0,  0,  0,
+                                  -1, -1, -1 };
 
-                float edgeFuzz = tex2D(_NoiseTex, wuv * 25.0).r;
-                if (result > 0.05 && result < 0.95)
-                    result = saturate(result * lerp(0.85, 1.1, edgeFuzz));
+                float gradientX = 0.0;
+                float gradientY = 0.0;
 
-                if (_BleedDebug > 0.5)
-                    return float4(bleed, bleed, bleed, 1.0);
+                [unroll]
+                for (int x = -1; x <= 1; ++x)
+                {
+                    [unroll]
+                    for (int y = -1; y <= 1; ++y)
+                    {
+                        float2 sampleUV = i.uv + _MainTex_TexelSize.xy * float2(x, y);
+                        float luminance = tex2D(_MainTex, sampleUV).r;
 
+                        gradientX += kernelX[x + 1][y + 1] * luminance;
+                        gradientY += kernelY[x + 1][y + 1] * luminance;
+                    }
+                }
+
+                float magnitude = sqrt(gradientX * gradientX + gradientY * gradientY);
+                float edge = magnitude > _EdgeThreshold ? 1.0 : 0.0;
+
+                return fixed4(edge, edge, edge, edge);
+            }
+            ENDCG
+        }
+
+        // ------------------------------------------------------------
+        // 4 - DoG Edge Detection
+        // ------------------------------------------------------------
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert
+            #pragma fragment frag
+
+            fixed4 frag(v2f i) : SV_Target
+            {
+                float sigmaSmall = max(0.3, _DoGSigma);
+                float sigmaLarge = sigmaSmall * max(1.01, _DoGK);
+
+                float blurSmall = 0.0;
+                float blurLarge = 0.0;
+
+                float weightSmallSum = 0.0;
+                float weightLargeSum = 0.0;
+
+                [unroll]
+                for (int y = -3; y <= 3; ++y)
+                {
+                    [unroll]
+                    for (int x = -3; x <= 3; ++x)
+                    {
+                        float2 offset = float2(x, y);
+                        float2 sampleUV = i.uv + _MainTex_TexelSize.xy * offset;
+
+                        float luminance = tex2D(_MainTex, sampleUV).r;
+
+                        float weightSmall = GaussianWeight(offset, sigmaSmall);
+                        float weightLarge = GaussianWeight(offset, sigmaLarge);
+
+                        blurSmall += luminance * weightSmall;
+                        blurLarge += luminance * weightLarge;
+
+                        weightSmallSum += weightSmall;
+                        weightLargeSum += weightLarge;
+                    }
+                }
+
+                blurSmall /= weightSmallSum;
+                blurLarge /= weightLargeSum;
+
+                float response = abs(blurSmall - blurLarge) * max(1.0, _DoGGain);
+
+                float threshold = _EdgeThreshold;
+                float softness = max(threshold * 0.25, 1e-4);
+
+                float edge = smoothstep(
+                    threshold - softness,
+                    threshold + softness,
+                    response
+                );
+
+                return fixed4(edge, edge, edge, edge);
+            }
+            ENDCG
+        }
+
+        // ------------------------------------------------------------
+        // 5 - Stippling
+        // ------------------------------------------------------------
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert
+            #pragma fragment frag
+
+            float4 frag(v2f i) : SV_Target
+            {
+                float luminance = tex2D(_MainTex, i.uv).r;
+
+                float3 worldPos = ReconstructWorldPosition(i.uv);
+                float2 noiseUV = (worldPos.xz + worldPos.yy) * _StippleWorldScale;
+                noiseUV *= _StippleSize;
+
+                float noise = tex2Dlod(_TexNoise, float4(noiseUV, 0, 0)).a;
+
+                luminance = saturate(_LuminanceContrast * (luminance - 0.5) + 0.5);
+                luminance = saturate(pow(luminance, 1.0 / _LuminanceCorrection));
+
+                float stipple = luminance < noise ? 1.0 : 0.0;
+                return float4(stipple, stipple, stipple, stipple);
+            }
+            ENDCG
+        }
+
+        // ------------------------------------------------------------
+        // 6 - Combine Edge and Stipple
+        // ------------------------------------------------------------
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert
+            #pragma fragment frag
+
+            float4 frag(v2f i) : SV_Target
+            {
+                float edge = tex2D(_MainTex, i.uv).r;
+                float4 stipple = tex2D(_TexStipple, i.uv);
+
+                // depth 在原代码里是 (1 - Linear01Depth)：近=1, 远=0
+                float depth = saturate(1.0 - Linear01Depth(tex2D(_CameraDepthTexture, i.uv).r));
+
+                if (_UseInputImage < 0.5 && depth < 0.0001)
+                {
+                    stipple *= depth;
+                }
+
+                // 远山淡墨：按深度对线条做粗细/浓度淡化（近浓远淡）
+                // 仅在 3D 模式下生效，避免使用静态图片时把线条整个削掉
+                if (_UseInputImage < 0.5)
+                {
+                    float fade = lerp(_EdgeFadeFar, _EdgeFadeNear, depth);
+                    edge *= fade;
+                }
+
+                float result = 1.0 - saturate(edge + stipple.r);
                 return float4(result, result, result, result);
             }
             ENDCG
         }
 
-        // 8 - DoG (Difference of Gaussians) Edge Detection
-        Pass {
+        // ------------------------------------------------------------
+        // 7 - Final Colour Composition
+        // ------------------------------------------------------------
+        Pass
+        {
             CGPROGRAM
-            #pragma vertex vp
-            #pragma fragment fp
+            #pragma vertex vert
+            #pragma fragment frag
 
-            float Gauss(float2 d, float sigma) {
-                float s2 = sigma * sigma;
-                return exp(-dot(d, d) / (2.0 * s2));
-            }
+            float4 frag(v2f i) : SV_Target
+            {
+                float4 ink = tex2D(_TexInk, i.uv);
+                float4 paper = tex2D(_TexPaper, i.uv);
+                float mask = tex2D(_MainTex, i.uv).r;
 
-            fixed4 fp(v2f i) : SV_Target {
-                float sigma1 = max(0.3, _DogSigma);
-                float sigma2 = sigma1 * max(1.01, _DogK);
-
-                float sum1 = 0.0, sum2 = 0.0;
-                float w1   = 0.0, w2   = 0.0;
-
-                [unroll]
-                for (int y = -3; y <= 3; ++y) {
-                    [unroll]
-                    for (int x = -3; x <= 3; ++x) {
-                        float2 o  = float2(x, y);
-                        float  l  = tex2D(_MainTex, i.uv + _MainTex_TexelSize.xy * o).r;
-                        float  g1 = Gauss(o, sigma1);
-                        float  g2 = Gauss(o, sigma2);
-                        sum1 += l * g1; w1 += g1;
-                        sum2 += l * g2; w2 += g2;
-                    }
-                }
-
-                float b1 = sum1 / w1;
-                float b2 = sum2 / w2;
-
-                float response = abs(b1 - b2) * max(1.0, _DogGain);
-
-                float thr  = _ContrastThreshold;
-                float aa   = max(thr * 0.25, 1e-4);
-                float edge = smoothstep(thr - aa, thr + aa, response);
-                return fixed4(edge, edge, edge, edge);
+                return mask >= 1.0 ? paper : ink;
             }
             ENDCG
+        }
+
+        // ------------------------------------------------------------
+        // 8 - Ink Bleed
+        // ------------------------------------------------------------
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert
+            #pragma fragment frag
+
+            static const float2 PoissonDisk12[12] =
+            {
+                float2(-0.326, -0.406),
+                float2(-0.840, -0.074),
+                float2(-0.696,  0.457),
+                float2(-0.203,  0.621),
+                float2( 0.962, -0.195),
+                float2( 0.473, -0.480),
+                float2( 0.519,  0.767),
+                float2( 0.185, -0.893),
+                float2( 0.507,  0.064),
+                float2( 0.896,  0.412),
+                float2(-0.322, -0.933),
+                float2(-0.792, -0.598)
+            };
+
+            float4 frag(v2f i) : SV_Target
+            {
+                float center = tex2D(_MainTex, i.uv).r;
+
+                float3 worldPos = ReconstructWorldPosition(i.uv);
+                float2 worldUV = (worldPos.xz + worldPos.yy) * _BleedWorldScale;
+
+                float macroNoise = tex2D(_TexNoise, worldUV * 0.6).r;
+                float microNoise = tex2D(_TexNoise, worldUV * 7.3 + float2(0.37, 0.11)).r;
+
+                float luminance = tex2D(_TexLuminance, i.uv).r;
+
+                float darkThreshold = saturate(_BleedDarkThreshold);
+                float darkSoftness = max(0.01, _BleedDarkSoftness);
+
+                float darkMask = 1.0 - smoothstep(
+                    darkThreshold - darkSoftness,
+                    darkThreshold + darkSoftness,
+                    luminance
+                );
+
+                darkMask = lerp(1.0, darkMask, step(0.5, _BleedDarkOnly));
+
+                float noiseLow  = tex2D(_TexNoise, worldUV * 1.7 + float2(0.19, 0.83)).r;
+                float noiseMid  = tex2D(_TexNoise, worldUV * 4.3 + float2(0.71, 0.29)).r;
+                float noiseHigh = tex2D(_TexNoise, worldUV * 9.1 + float2(0.43, 0.57)).r;
+
+                float partialNoise = noiseLow * 0.5 + noiseMid * 0.35 + noiseHigh * 0.15;
+
+                float partialMask = smoothstep(
+                    _BleedPartialThreshold,
+                    saturate(_BleedPartialThreshold + 0.25),
+                    partialNoise
+                );
+
+                float bleedMask = saturate(darkMask * partialMask);
+
+                if (bleedMask < 0.01)
+                {
+                    return float4(center, center, center, center);
+                }
+
+                float bleedStrength = max(0.0, _BleedStrength) * bleedMask;
+                float normalizedStrength = saturate(bleedStrength / 3.0);
+
+                float radius = _BleedRadius
+                    * lerp(1.0 - _BleedIrregularity, 1.0 + _BleedIrregularity, microNoise)
+                    * lerp(0.2, 0.9, normalizedStrength);
+
+                float falloffPower = lerp(4.0, 1.6, normalizedStrength);
+
+                float accumulatedBleed = center;
+
+                [unroll]
+                for (int k = 0; k < 12; ++k)
+                {
+                    float2 offset = PoissonDisk12[k];
+
+                    float jitter = tex2D(_TexNoise, worldUV * 13.1 + offset * 0.27).r;
+                    float sampleRadius = radius * (0.35 + jitter);
+
+                    float sampledEdge = tex2D(
+                        _MainTex,
+                        i.uv + _MainTex_TexelSize.xy * offset * sampleRadius
+                    ).r;
+
+                    float falloff = pow(saturate(1.0 - length(offset)), falloffPower);
+
+                    accumulatedBleed = max(accumulatedBleed, sampledEdge * falloff);
+                }
+
+                float bleed = pow(
+                    saturate(accumulatedBleed * lerp(0.75, 1.15, macroNoise)),
+                    1.0 / max(0.01, _BleedDensity)
+                );
+
+                bleed *= normalizedStrength;
+                bleed = saturate(bleed + max(0.0, bleedStrength - 1.0) * bleed * 0.2);
+
+                float opacity = pow(saturate(bleed), max(0.05, _BleedFadeGamma));
+                opacity = saturate(opacity * lerp(0.9, 1.1, microNoise));
+
+                float targetInkValue = 1.0;
+                float target = lerp(center, targetInkValue, opacity);
+
+                float result = lerp(center, target, bleedMask);
+
+                float edgeFuzz = tex2D(_TexNoise, worldUV * 25.0).r;
+
+                if (result > 0.05 && result < 0.95)
+                {
+                    result = saturate(result * lerp(0.85, 1.1, edgeFuzz));
+                }
+
+                if (_BleedDebug > 0.5)
+                {
+                    return float4(bleed, bleed, bleed, 1.0);
+                }
+
+                return float4(result, result, result, result);
+            }
+    ENDCG
         }
     }
 }
